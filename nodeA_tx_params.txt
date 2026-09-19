@@ -1,0 +1,32 @@
+======================================================================
+NODE A TX REFERENCE MODEL
+======================================================================
+Chip rate            : 100.0 Mcps
+Fabric sps / rate    : 8  ->  800.0 MSPS
+Code (m-seq) degree  : 15  ->  period L = 32767 chips
+Code period          : 327.67 us
+Round-trip (44 km)   : 293.54 us   (one-way 146.77 us)
+Ambiguity margin     : code period > round trip (1.12x)
+RRC roll-off / span  : beta=0.25, span=10 chips
+DAC sample rate      : 9.60 GSa/s
+RFDC interpolation   : x12   (800 MHz -> 9.60 GHz)
+RF center            : 5.800 GHz  (Nyquist zone 2 of DAC)
+NCO frequency        : 3.800 GHz  (image at fs-NCO = 5.800 GHz)
+
+PRN validation (PRBS15, taps x^15+x^14+1):
+  balance (ones/zeros)     : 16384/16383  (ideal 16384/16383)
+  autocorr peak            : 32767
+  max off-peak sidelobe    : 1   (ideal -1)
+  peak/sidelobe ratio      : 90.3 dB
+
+RRC filter: 81 taps @ 800 MSPS (span 10 chips, sps 8)
+Occupied BW (RRC)        : 125.0 MHz  (+/-62.5 MHz)
+ZVBP-5800 passband       : 150 MHz  (5725-5875)
+  -> fits in BPF          : YES
+
+RF placement:
+  DAC sinc |H| at 5.80 GHz : 0.499  (-6.0 dB)
+  (recovered by PA gain; expected for 2nd-Nyquist operation)
+
+
+Files: rrc_taps.coe, prn_bram.coe, fig1..fig5 png
