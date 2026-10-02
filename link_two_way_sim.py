@@ -26,32 +26,35 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-rng = np.random.default_rng(7)
+rng = np.random.default_rng(7) #for repeatability
 OUT = "/mnt/user-data/outputs"
 os.makedirs(OUT, exist_ok=True)
 
-# ---------------- parameters (mirror the TX/link models) ----------------
-FCHIP=100e6; SPS=8; FS=FCHIP*SPS
-DEG=15; L=2**DEG-1; BETA=0.25; SPAN=10
-FRF=5.8e9; N=L*SPS; TCODE=L/FCHIP
-C=299_792_458.0; D_LINK=44e3
+# parameters (mirror the TX/link models)
+FCHIP=100e6; SPS=8; FS=FCHIP*SPS            #fives 100Mcps, 8 samples per chip, 800 MSPS
+DEG=15; L=2**DEG-1; BETA=0.25; SPAN=10      #15 stage LFSR, L=32,767 chips
+FRF=5.8e9; N=L*SPS; TCODE=L/FCHIP           #only used in link budget since we're working in complex baseband
+C=299_792_458.0; D_LINK=44e3                #distance of link
 
-# ---------------- LINK BUDGET from datasheet values ----------------
+# LINK BUDGET from datasheet values
 # PA ZHL-1W-63-S+ OP1dB +28 dBm | LNA ZX60-83LN-S+ NF 1.56 dB | BPF ZVBP-5800-S+ IL 0.8 dB
 # 0.9 m dish, aperture efficiency 0.6
 Pt_dBm=28.0; IL_BPF=0.8; NF_LNA=1.56; D_DISH=0.9; EFF=0.6; L_ATM=0.5; L_PT=2.0
 lam=C/FRF
-G_DISH=10*np.log10(EFF*(np.pi*D_DISH/lam)**2)
-FSPL=92.45+20*np.log10(D_LINK/1e3)+20*np.log10(FRF/1e9)
-Pr=Pt_dBm-IL_BPF+G_DISH-FSPL-L_ATM-L_PT+G_DISH-IL_BPF
-N0=-174+IL_BPF+NF_LNA                       # -171.6 dBm/Hz
-CN0=Pr-N0                                   # ~120 dB-Hz
+G_DISH=10*np.log10(EFF*(np.pi*D_DISH/lam)**2)               #aperature gain
+FSPL=92.45+20*np.log10(D_LINK/1e3)+20*np.log10(FRF/1e9)     #Free space path loss formula
+Pr=Pt_dBm-IL_BPF+G_DISH-FSPL-L_ATM-L_PT+G_DISH-IL_BPF       #received power
+N0=-174+IL_BPF+NF_LNA                                       # Noise density w/ filter ahead of LNA = -171.6 dBm/Hz
+CN0=Pr-N0                                                   # ~120 dB-Hz
 
 REPORT=[]
 def say(s=""):
     print(s); REPORT.append(s)
 
-# ---------------- code + filter helpers ----------------
+# code + filter helpers
+#A Fibonacci shift register that starts at all ones
+#Each step it outputs the last stage, XORs the tapped stages to form the feedback bit, and shifts that bit in at the front
+#Returns 2^deg − 1 bits.
 def lfsr(deg,taps):
     st=[1]*deg; out=np.empty(2**deg-1,np.int8)
     for i in range(out.size):
@@ -60,6 +63,8 @@ def lfsr(deg,taps):
         st=[fb]+st[:-1]
     return out
 
+#Runs the register until the state returns to the seed.
+#The code is maximal-length only if that first return happens at step 32,767.
 def is_maximal(deg,taps):
     """Definitive: LFSR returns to seed exactly at period 2^deg-1, not before."""
     st=[1]*deg; seed=tuple(st)
@@ -72,10 +77,12 @@ def is_maximal(deg,taps):
     return False
 
 # pick two distinct maximal-length codes (one per direction)
-cands=[[15,14],[15,1],[15,4],[15,7],[15,13],[15,14,13,11]]
-good=[t for t in cands if is_maximal(DEG,t)]
-TAPS_AB, TAPS_BA = good[0], good[1]
+cands=[[15,14],[15,1],[15,4],[15,7],[15,13],[15,14,13,11]]  #lists candidate tap sets
+good=[t for t in cands if is_maximal(DEG,t)]                #keep the ones that pass is_maximal
+TAPS_AB, TAPS_BA = good[0], good[1]                         #the first 2 survivors, one code per direction
 
+#The standard root-raised-cosine formula, with the special cases at t = 0 and t = ±1/(4β)
+# normalized to unit energy and gives 81 taps.
 def rrc(beta,sps,span):
     Nt=span*sps; t=np.arange(-Nt/2,Nt/2+1)/sps; h=np.empty_like(t)
     for i,ti in enumerate(t):
@@ -88,53 +95,71 @@ def rrc(beta,sps,span):
     return h/np.sqrt(np.sum(h**2))
 H=rrc(BETA,SPS,SPAN)
 
+
 def build(taps):
-    bpsk=1.0-2.0*lfsr(DEG,taps)
-    up=np.zeros(N); up[::SPS]=bpsk
-    s=np.convolve(np.tile(up,2),H,mode="same")[:N]
-    s=s/np.sqrt(np.mean(np.abs(s)**2))
-    ref=np.convolve(np.tile(s,2),H[::-1],mode="same")[:N]
-    ref=ref/np.sqrt(np.mean(np.abs(ref)**2))
-    return s.astype(complex), ref
+    bpsk=1.0-2.0*lfsr(DEG,taps)                                 # maps bits to +-1 (0 to +1, 1 to -1)
+    up=np.zeros(N); up[::SPS]=bpsk                              # zero-stuffs to 8 samples per chip
+    s=np.convolve(np.tile(up,2),H,mode="same")[:N]              # convolves w/ RRC filter
+    s=s/np.sqrt(np.mean(np.abs(s)**2))                          # Normalizes to unit average power. This is the transmit waveform s
+    ref=np.convolve(np.tile(s,2),H[::-1],mode="same")[:N]       # Convolves s with the time-reversed RRC (the matched filter)
+    ref=ref/np.sqrt(np.mean(np.abs(ref)**2))                    # Normalize
+    return s.astype(complex), ref                               # correlator reference ref
 
 S_AB,R_AB = build(TAPS_AB)     # A transmits this; B correlates
 S_BA,R_BA = build(TAPS_BA)     # B transmits this; A correlates
-Ps=np.mean(np.abs(S_AB)**2)
-RF_AB=np.fft.fft(R_AB); RF_BA=np.fft.fft(R_BA)
-_fb=np.fft.fftfreq(N)
+Ps=np.mean(np.abs(S_AB)**2)    # Transmit power
+RF_AB=np.fft.fft(R_AB); RF_BA=np.fft.fft(R_BA)      # FFTs of the references
+_fb=np.fft.fftfreq(N)                               # FFT frewuency axis
 
-# cross-isolation between the two direction codes (should be low)
+# The cross-correlation of A's waveform with B's reference, compared to A's own autocorrelation peak. 
+#It reports how well the two codes reject each other.
 xiso=np.abs(np.fft.ifft(np.fft.fft(S_AB)*np.conj(RF_BA)))
 iso_db=20*np.log10(np.abs(np.fft.ifft(np.fft.fft(S_AB)*np.conj(RF_AB))).max()/xiso.max())
 
-# ---------------- channel + receiver ----------------
+# channel + receiver
+# Delays a signal by τ samples (fractional allowed) by multiplying its spectrum by e^(−j2πfτ).
 def frac_delay(x,tau):
     return np.fft.ifft(np.fft.fft(x)*np.exp(-1j*2*np.pi*_fb*tau))
 
+# One 1-way measurement
 def link(s,tau_samp,ref_f,cn0=CN0,phi=0.0):
-    y=frac_delay(s,tau_samp)*np.exp(1j*phi)
-    sig2=Ps*FS/10**(cn0/10)
-    y=y+np.sqrt(sig2/2)*(rng.standard_normal(N)+1j*rng.standard_normal(N))
-    R=np.fft.ifft(np.fft.fft(y)*np.conj(ref_f)); mag=np.abs(R)
-    k=int(np.argmax(mag)); a,b,c=mag[(k-1)%N],mag[k],mag[(k+1)%N]
-    d=0.5*(a-c)/(a-2*b+c) if (a-2*b+c)!=0 else 0.0
+    y=frac_delay(s,tau_samp)*np.exp(1j*phi)         # delays the signal and applies a random carrier phase phi
+    sig2=Ps*FS/10**(cn0/10)                         #Adds complex Gaussian noise with variance PsxFS/CN0 per sample (sets C/N0)
+    y=y+np.sqrt(sig2/2)*(rng.standard_normal(N)+1j*rng.standard_normal(N)) 
+    R=np.fft.ifft(np.fft.fft(y)*np.conj(ref_f)); mag=np.abs(R)              # Correlates with the reference by FFT (circular cross-correlation).
+    k=int(np.argmax(mag)); a,b,c=mag[(k-1)%N],mag[k],mag[(k+1)%N]           # Takes the magnitude and finds the peak sample k
+    d=0.5*(a-c)/(a-2*b+c) if (a-2*b+c)!=0 else 0.0                          # Refines it with a 3-point parabolic interpretationn
     return ((k+d)%N)/FS, mag        # arrival time [s], correlator magnitude
 
-# ---------------- truth ----------------
-d_true   = D_LINK/C            # reciprocal one-way delay ~146.77 us
-Delta0   = 3.0e-9             # clock offset B wrt A [s]
+# truth
+d_true   = D_LINK/C          # reciprocal one-way delay ~146.77 us
+Delta0   = 1.0e-9            # clock offset B wrt A [s]
 y_frac   = 1.0e-11           # fractional frequency offset (Rb-class)
 h_AB     = 12.3e-9           # hardware delay on A->B measurement
 h_BA     = 8.7e-9            # hardware delay on B->A measurement
-CAL_D    = (h_AB-h_BA)/2      # calibration constants (measured once)
+CAL_D    = (h_AB-h_BA)/2     # calibration constants (measured once)
 CAL_d    = (h_AB+h_BA)/2
 
+# Makes both measurements
 def two_way(Delta, cn0=CN0):
-    M_AB,magAB = link(S_AB,((d_true+Delta+h_AB)*FS)%N, RF_AB, cn0, rng.uniform(0,2*np.pi))
-    M_BA,magBA = link(S_BA,((d_true-Delta+h_BA)*FS)%N, RF_BA, cn0, rng.uniform(0,2*np.pi))
-    Delta_hat=(M_AB-M_BA)/2
-    d_hat    =(M_AB+M_BA)/2
+    # This is the A→B measurement, made at B
+    # The delay is d + Δ + h_AB seconds. Multiplying by FS converts it to samples, and % N wraps it inside one code period, because the sim is circular.
+    # S_AB is A's transmit waveform and RF_AB is the FFT of B's correlator reference for that code.
+    # cn0 sets the noise level.
+    # rng.uniform(0, 2π) is a random carrier phase each epoch, standing in for the unknown carrier phase between the two nodes.
+    # link returns the peak arrival time M_AB in seconds and the whole correlator magnitude array magAB, which is kept for the plots.
+    M_AB,magAB = link(S_AB,((d_true+Delta+h_AB)*FS)%N, RF_AB, cn0, rng.uniform(0,2*np.pi))      
+    # This is the B→A measurement, made at A
+    # It uses B's code S_BA and reference RF_BA
+    # The sign of Δ is flipped, because A's clock is behind B's by the amount B's is ahead of A's
+    # It uses the other hardware delay h_BA
+    M_BA,magBA = link(S_BA,((d_true-Delta+h_BA)*FS)%N, RF_BA, cn0, rng.uniform(0,2*np.pi))      
+    Delta_hat=(M_AB-M_BA)/2     # It gets independent noise and an independent random phase.
+    d_hat    =(M_AB+M_BA)/2     # The clock-offset estimate. Subtracting cancels d, leaving Δ + (h_AB − h_BA)/2.
     return M_AB,M_BA,Delta_hat,d_hat,magAB,magBA
+
+# One simplification to know about: both codes are assumed to start at time zero on a shared epoch, so M_AB is the peak position within one code period.
+# In hardware this alignment comes from the PPS and the timestamp counter.
 
 say("="*70); say("TWO-WAY LINK SIMULATION (A <-> B)"); say("="*70)
 say(f"codes: A->B taps {TAPS_AB}, B->A taps {TAPS_BA} (both maximal-length)")
@@ -144,7 +169,7 @@ say(f"  (PA +{Pt_dBm:.0f} dBm, dish {G_DISH:.1f} dBi x2, FSPL {FSPL:.1f} dB, LNA
 say(f"one-way delay d = {d_true*1e6:.3f} us")
 say("")
 
-# ---------------- (1) single epoch ----------------
+# single epoch
 M_AB,M_BA,Dh,dh,magAB,magBA = two_way(Delta0)
 Dh_cal=Dh-CAL_D; dh_cal=dh-CAL_d
 say("(1) Single two-way epoch:")
@@ -158,7 +183,7 @@ say(f"    d_hat (calib)     : {dh_cal*1e6:.6f} us   (true d {d_true*1e6:.6f} us,
     f"err {(dh_cal-d_true)*1e12:+.0f} ps)")
 say("")
 
-# ---------------- (3) multi-epoch drift + frequency ----------------
+# multi-epoch drift + frequency
 NE=120; Tep=1.0                       # epochs at 1 s spacing (PPS cadence)
 t=np.arange(NE)*Tep
 Dtrue=Delta0 + y_frac*t
@@ -181,6 +206,7 @@ say("")
 C0,C1,C2,C3="#1f77b4","#d62728","#2ca02c","#9467bd"
 
 # Fig 1: two correlator peaks (the two measurements)
+# overlays both correlation peaks (±200 samples, aligned at zero lag, in ns).
 fig,ax=plt.subplots(figsize=(8,4))
 lag=(np.arange(N)/FS)*1e6
 kA=int(np.argmax(magAB)); kB=int(np.argmax(magBA)); w=200
@@ -195,6 +221,7 @@ ax.grid(alpha=.3); ax.legend(fontsize=9)
 fig.tight_layout(); fig.savefig(f"{OUT}/tw_fig1_peaks.png",dpi=130); plt.close(fig)
 
 # Fig 2: multi-epoch Delta(t) tracked, d(t) flat  (money plot)
+# shows Δ̂(t) against the true ramp with the fit, plus d̂ − d on a twin axis.
 fig,axL=plt.subplots(figsize=(9,4.6))
 axL.plot(t,Dcal*1e9,"o",color=C0,ms=4,label="two-way Delta_hat (calibrated)")
 axL.plot(t,Dtrue*1e9,"-",color=C2,lw=2,label="true Delta(t) = 3 ns + 1e-11 * t")
@@ -212,6 +239,7 @@ axL.legend(l1+l2,lab1+lab2,fontsize=8,loc="upper left")
 fig.tight_layout(); fig.savefig(f"{OUT}/tw_fig2_tracking.png",dpi=130); plt.close(fig)
 
 # Fig 3: calibration bar (raw vs calibrated Delta)
+# The third is a bar chart of raw, calibrated and true Δ
 fig,ax=plt.subplots(figsize=(6.5,4))
 vals=[Dh*1e9, Dh_cal*1e9, Delta0*1e9]
 labels=["raw\n(Delta+cal bias)","calibrated","true"]
